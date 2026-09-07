@@ -41,6 +41,7 @@ Options:
   -t, --threshold <n>      exit with code 0 if all regressions are below threshold, else 1
       --post-checkout      an optional command to run after checking out each branch to
                            configure the git repo so that 'go build' succeeds
+      --roachprod          run benchmarks on node 1 of an existing roachprod cluster
       --csv                output the results in a csv format
       --html               output the results in an HTML table
       --sheets             output the results to a new Google Sheets document
@@ -51,6 +52,7 @@ Example invocations:
   $ benchdiff --old=master~ --new=master --threshold=0.2 ./pkg/kv ./pkg/storage/...
   $ benchdiff --old-env=FEATURE=false --new-env=FEATURE=true ./pkg/kv/...
   $ benchdiff --new=d1fbdb2 --run=Datum --count=2 --csv ./pkg/sql/...
+  $ benchdiff --roachprod=user-bench ./pkg/util/uuid
   $ benchdiff --new=6299bd4 --sheets --post-checkout='dev generate go' ./pkg/workload/...
 ```
 
@@ -68,6 +70,25 @@ $ benchdiff \
 Both sides use the same binary built from `HEAD`. Specify `--old` or `--new` to
 combine environment overrides with the usual commit comparison. Repeat an
 environment option to override multiple variables.
+
+Running benchmarks on an existing roachprod cluster:
+
+```
+$ benchdiff -b \
+    --roachprod=shubham-bench \
+    --old-env=FEATURE=false \
+    --new-env=FEATURE=true \
+    --cpuprofile --memprofile --mutexprofile \
+    ./pkg/util/uuid
+```
+
+`benchdiff` builds binaries on the local Linux machine, uploads them to node 1,
+and runs the old and new suites there. The local machine and VM must therefore
+have compatible operating systems and architectures. The `roachprod` command
+must be available in `PATH`, and the cluster must already exist. Benchmark
+output and profiles are copied into the same local `benchdiff/<ref>/artifacts`
+directories used by local runs. When both suites share a binary, as in an
+environment-only comparison, it is uploaded only once.
 
 Using text output:
 

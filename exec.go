@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"io"
 	"os"
 	"os/exec"
@@ -54,13 +55,22 @@ func spawnWith(in io.Reader, out, err io.Writer, args ...string) error {
 // spawnWithEnv executes the command with the supplied environment overrides.
 // The command continues to inherit all other variables from benchdiff.
 func spawnWithEnv(in io.Reader, out, err io.Writer, env []string, args ...string) error {
+	return spawnWithEnvContext(context.Background(), in, out, err, env, args...)
+}
+
+// spawnWithEnvContext executes the command with the supplied environment
+// overrides and stops it when ctx is cancelled. The command continues to
+// inherit all other variables from benchdiff.
+func spawnWithEnvContext(
+	ctx context.Context, in io.Reader, out, err io.Writer, env []string, args ...string,
+) error {
 	var cmd *exec.Cmd
 	if len(args) == 0 {
 		panic("spawn called with no arguments")
 	} else if len(args) == 1 {
-		cmd = exec.Command(args[0])
+		cmd = exec.CommandContext(ctx, args[0])
 	} else {
-		cmd = exec.Command(args[0], args[1:]...)
+		cmd = exec.CommandContext(ctx, args[0], args[1:]...)
 	}
 
 	cmd.Env = commandEnv(os.Environ(), env)

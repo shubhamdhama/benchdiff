@@ -23,7 +23,7 @@ import (
 	"golang.org/x/perf/benchstat"
 )
 
-const usage = `usage: benchdiff [--old <commit>] [--new <commit>] [--old-env <key=value>] [--new-env <key=value>] <pkgs>...`
+const usage = `usage: benchdiff [--old <commit>] [--new <commit>] [--old-env <key=value>] [--new-env <key=value>] [--roachprod <cluster>] <pkgs>...`
 
 const helpString = `benchdiff automates the process of running and comparing Go microbenchmarks
 across code changes and runtime configurations.
@@ -60,6 +60,7 @@ Options:
       --cpuprofile          record and write cpu profiles
       --memprofile          record and write allocation profiles
       --mutexprofile        record and write mutex contention profiles
+      --roachprod <cluster> run benchmarks on node 1 of an existing roachprod cluster
   -t, --threshold <n>       exit with code 0 if all regressions are below threshold, else 1
   -p, --previous-run <time> time of previous run; skip running benches and just (re)process previous run
       --post-checkout       an optional command to run after checking out each branch to
@@ -77,6 +78,7 @@ Example invocations:
   $ benchdiff --old=master~ --new=master --threshold=0.2 ./pkg/kv ./pkg/storage/...
   $ benchdiff --old-env=FEATURE=false --new-env=FEATURE=true ./pkg/kv/...
   $ benchdiff --new=d1fbdb2 --run=Datum --count=2 --csv ./pkg/sql/...
+  $ benchdiff --roachprod=user-bench --cpuprofile ./pkg/util/uuid
   $ benchdiff --new=6299bd4 --sheets --post-checkout='dev generate go' ./pkg/workload/...`
 
 // TODO: it's unclear whether G Suite Domain-wide Delegation is required for the
@@ -140,7 +142,7 @@ func main() {
 
 func run(ctx context.Context) error {
 	var help, outCSV, outHTML, outSheets bool
-	var oldRef, newRef, order, postChck, runPattern, benchTime, previousRun string
+	var oldRef, newRef, order, postChck, runPattern, benchTime, previousRun, roachprodCluster string
 	var oldEnvValues, newEnvValues []string
 	var itersPerTest int
 	var cpuProfile, memProfile, mutexProfile bool
@@ -166,6 +168,7 @@ func run(ctx context.Context) error {
 	pflag.BoolVarP(&cpuProfile, "cpuprofile", "", false, "")
 	pflag.BoolVarP(&memProfile, "memprofile", "", false, "")
 	pflag.BoolVarP(&mutexProfile, "mutexprofile", "", false, "")
+	pflag.StringVar(&roachprodCluster, "roachprod", "", "")
 	pflag.Float64VarP(&threshold, "threshold", "t", -1, "")
 	pflag.StringVarP(&previousRun, "previous-run", "p", "", "")
 	pflag.BoolVarP(&preview, "preview", "", true, "")
@@ -249,14 +252,25 @@ func run(ctx context.Context) error {
 	printHeader(os.Stdout, oldSuite, newSuite)
 
 	if previousRun == "" {
+		var runner benchRunner = localBenchRunner{}
+		if roachprodCluster != "" {
+			runner, err = newRoachprodBenchRunner(roachprodCluster)
+			if err != nil {
+				return err
+			}
+		}
+
 		if err := buildBenches(ctx, pkgFilter, postChck, &oldSuite, &newSuite); err != nil {
+			return err
+		}
+		if err := runner.Prepare(ctx, &oldSuite, &newSuite); err != nil {
 			return err
 		}
 
 		// Run the benchmarks.
 		tests := oldSuite.intersectTests(&newSuite)
 		err = runCmpBenches(
-			ctx, &oldSuite, &newSuite, tests.sorted(), runPattern,
+			ctx, runner, &oldSuite, &newSuite, tests.sorted(), runPattern,
 			benchTime, cpuProfile, memProfile, mutexProfile, itersPerTest, preview,
 		)
 		if err != nil {
@@ -362,6 +376,7 @@ func buildBenches(
 
 func runCmpBenches(
 	ctx context.Context,
+	runner benchRunner,
 	bs1, bs2 *benchSuite,
 	tests []string,
 	runPattern, benchTime string,
@@ -373,11 +388,22 @@ func runCmpBenches(
 	for i, t := range tests {
 		pkg := testBinToPkg(t)
 		m := w.GetMark()
+		run := benchRun{
+			test:         t,
+			runPattern:   runPattern,
+			benchTime:    benchTime,
+			cpuProfile:   cpuProfile,
+			memProfile:   memProfile,
+			mutexProfile: mutexProfile,
+		}
 
 		// Log the command invocation once per test for each suite.
 		for _, b := range []*benchSuite{bs1, bs2} {
-			args := b.buildBenchArgs(t, runPattern, benchTime, cpuProfile, memProfile, mutexProfile)
-			if err := logRunCommand(b.getRunFile(b.timestamp), b.env, args); err != nil {
+			cmd, err := runner.Command(b, run)
+			if err != nil {
+				return errors.Wrap(err, "building benchmark command")
+			}
+			if err := logRunCommand(b.getRunFile(b.timestamp), cmd.env, cmd.args); err != nil {
 				return errors.Wrap(err, "logging run command")
 			}
 		}
@@ -412,7 +438,7 @@ func runCmpBenches(
 				// with a time correlation.
 				for _, b := range []*benchSuite{bs1, bs2} {
 					spinner.Update(" " + b.ref)
-					if err := b.runSingleBench(t, runPattern, benchTime, cpuProfile, memProfile, mutexProfile); err != nil {
+					if err := runSingleBench(ctx, runner, b, run); err != nil {
 						return err
 					}
 					if err := b.mergeProfiles(cpuProfile, memProfile, mutexProfile); err != nil {
@@ -426,6 +452,24 @@ func runCmpBenches(
 			}
 		}
 		w.ClearToMark(m)
+	}
+	return nil
+}
+
+func runSingleBench(
+	ctx context.Context, runner benchRunner, bs *benchSuite, run benchRun,
+) error {
+	if err := runner.Run(ctx, bs, run); err != nil {
+		if exitErr, ok := err.(*exec.ExitError); ok {
+			if exitErr.ExitCode() == 1 {
+				// Assume exit code 1 corresponds to a benchmark failure.
+				fmt.Fprintln(os.Stderr, "  saw one or more benchmark failures")
+			} else {
+				return errors.Wrapf(err, "error running benchmark: %s", exitErr.Stderr)
+			}
+		} else {
+			return errors.Wrap(err, "error running benchmark")
+		}
 	}
 	return nil
 }
@@ -506,12 +550,24 @@ func (bs *benchSuite) mergeProfiles(cpuProfile, memProfile, mutexProfile bool) e
 func (bs *benchSuite) buildBenchArgs(
 	test, runPattern, benchTime string, cpuProfile, memProfile, mutexProfile bool,
 ) []string {
-	bin := bs.getTestBinary(test)
+	return bs.buildBenchArgsAt(
+		test, bs.getTestBinary(test), bs.profileRunDir(), runPattern, benchTime,
+		cpuProfile, memProfile, mutexProfile,
+	)
+}
+
+// buildBenchArgsAt builds a benchmark invocation using explicit binary and
+// profile paths. Remote runners use this to preserve the benchmark semantics
+// while replacing paths that only exist on the local machine.
+func (bs *benchSuite) buildBenchArgsAt(
+	test, bin, profileDir, runPattern, benchTime string,
+	cpuProfile, memProfile, mutexProfile bool,
+) []string {
 
 	// Determine whether the binary has a --logtostderr flag. Use CombinedOutput
 	// and ignore the error because --help creates a failed error status. If there
 	// is a real error we'll hit it below.
-	cmd := exec.Command(bin, "--help")
+	cmd := exec.Command(bs.getTestBinary(test), "--help")
 	cmd.Env = commandEnv(os.Environ(), bs.env)
 	out, _ := cmd.CombinedOutput()
 	hasLogToStderr := bytes.Contains(out, []byte("logtostderr"))
@@ -521,38 +577,19 @@ func (bs *benchSuite) buildBenchArgs(
 		args = append(args, "-test.benchtime", benchTime)
 	}
 	if cpuProfile {
-		args = append(args, "-test.cpuprofile", bs.profileRunPath(cpuProfileName))
+		args = append(args, "-test.cpuprofile", filepath.Join(profileDir, cpuProfileName))
 	}
 	if memProfile {
 		// TODO(nvanbenschoten): consider passing -test.memprofilerate=1.
-		args = append(args, "-test.memprofile", bs.profileRunPath(memProfileName))
+		args = append(args, "-test.memprofile", filepath.Join(profileDir, memProfileName))
 	}
 	if mutexProfile {
-		args = append(args, "-test.mutexprofile", bs.profileRunPath(mutexProfileName))
+		args = append(args, "-test.mutexprofile", filepath.Join(profileDir, mutexProfileName))
 	}
 	if hasLogToStderr {
 		args = append(args, "--logtostderr", "NONE")
 	}
 	return args
-}
-
-func (bs *benchSuite) runSingleBench(
-	test, runPattern, benchTime string, cpuProfile, memProfile, mutexProfile bool,
-) error {
-	args := bs.buildBenchArgs(test, runPattern, benchTime, cpuProfile, memProfile, mutexProfile)
-	if err := spawnWithEnv(os.Stdin, bs.outFile, bs.outFile, bs.env, args...); err != nil {
-		if exitErr, ok := err.(*exec.ExitError); ok {
-			if exitErr.ExitCode() == 1 {
-				// Assume exit code 1 corresponds to a benchmark failure.
-				fmt.Fprintln(os.Stderr, "  saw one or more benchmark failures")
-			} else {
-				return errors.Wrapf(err, "error running %v: %s", args, exitErr.Stderr)
-			}
-		} else {
-			return errors.Wrapf(err, "error running %v", args)
-		}
-	}
-	return nil
 }
 
 // logRunCommand writes the benchmark invocation to the run file.
@@ -680,6 +717,7 @@ func checkPassing(thresh float64, tables []*benchstat.Table) error {
 }
 
 type benchSuite struct {
+	side      string
 	ref       string
 	subject   string // commit subject
 	env       []string
@@ -702,6 +740,7 @@ func makeBenchSuite(
 	side, ref, subject string, env []string, useBazel, isolateArtifacts bool,
 ) benchSuite {
 	bs := benchSuite{
+		side:      side,
 		ref:       ref,
 		subject:   subject,
 		env:       env,
