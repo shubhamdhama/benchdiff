@@ -6,14 +6,16 @@ A tool for automating the process of running and comparing Go benchmarks across 
 
 ```
 $ benchdiff --help
-usage: benchdiff [--old <commit>] [--new <commit>] <pkgs>...
+usage: benchdiff [--old <commit>] [--new <commit>] [--old-env <key=value>] [--new-env <key=value>] <pkgs>...
 
 benchdiff automates the process of running and comparing Go microbenchmarks
-across code changes.
+across code changes and runtime configurations.
 
 benchdiff runs all microbenchmarks in the specified packages against the old and
-new commit. It then passes the benchmark output through benchstat to compute
-statistics about the results.
+new commit or environment configuration. It then passes the benchmark output
+through benchstat to compute statistics about the results. Environment options
+override inherited variables only while running benchmark binaries, not while
+building them.
 
 By default, benchdiff outputs these results in a textual format. However, if the
 --sheets flag is passed then it will upload the result to a Google Sheets
@@ -31,6 +33,9 @@ environment variable. See https://cloud.google.com/docs/authentication/productio
 Options:
   -n, --new       <commit> measure the difference between this commit and old (default HEAD)
   -o, --old       <commit> measure the difference between this commit and new (default new~)
+      --new-env   <key=val> set an environment variable when running new; repeatable
+      --old-env   <key=val> set an environment variable when running old; repeatable
+                           with environment flags but no commits, compare HEAD to itself
   -r, --run       <regexp> run only benchmarks matching regexp
   -c, --count     <n>      run tests and benchmarks n times (default 10)
   -t, --threshold <n>      exit with code 0 if all regressions are below threshold, else 1
@@ -44,11 +49,25 @@ Options:
 Example invocations:
   $ benchdiff --sheets ./pkg/...
   $ benchdiff --old=master~ --new=master --threshold=0.2 ./pkg/kv ./pkg/storage/...
+  $ benchdiff --old-env=FEATURE=false --new-env=FEATURE=true ./pkg/kv/...
   $ benchdiff --new=d1fbdb2 --run=Datum --count=2 --csv ./pkg/sql/...
   $ benchdiff --new=6299bd4 --sheets --post-checkout='dev generate go' ./pkg/workload/...
 ```
 
 ## Examples
+
+Comparing two runtime configurations of the current commit:
+
+```
+$ benchdiff \
+    --old-env=COCKROACH_TEST_DRPC=false \
+    --new-env=COCKROACH_TEST_DRPC=true \
+    ./pkg/kv/kvserver
+```
+
+Both sides use the same binary built from `HEAD`. Specify `--old` or `--new` to
+combine environment overrides with the usual commit comparison. Repeat an
+environment option to override multiple variables.
 
 Using text output:
 

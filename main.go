@@ -23,14 +23,16 @@ import (
 	"golang.org/x/perf/benchstat"
 )
 
-const usage = `usage: benchdiff [--old <commit>] [--new <commit>] <pkgs>...`
+const usage = `usage: benchdiff [--old <commit>] [--new <commit>] [--old-env <key=value>] [--new-env <key=value>] <pkgs>...`
 
 const helpString = `benchdiff automates the process of running and comparing Go microbenchmarks
-across code changes.
+across code changes and runtime configurations.
 
 benchdiff runs all microbenchmarks in the specified packages against the old and
-new commit. It then passes the benchmark output through benchstat to compute
-statistics about the results.
+new commit or environment configuration. It then passes the benchmark output
+through benchstat to compute statistics about the results. Environment options
+override inherited variables only while running benchmark binaries, not while
+building them.
 
 By default, benchdiff outputs these results in a textual format. However, if the
 --sheets flag is passed then it will upload the result to a Google Sheets
@@ -49,6 +51,9 @@ Options:
   -n, --new       <commit>  measure the difference between this commit and old (default HEAD)
   -o, --old       <commit>  measure the difference between this commit and new (default new~)
                             'lastmerge' selects the most recent merge commit.
+      --new-env   <key=val> set an environment variable when running new; repeatable
+      --old-env   <key=val> set an environment variable when running old; repeatable
+                            with environment flags but no commits, compare HEAD to itself
   -r, --run       <regexp>  run only benchmarks matching regexp
   -c, --count     <n>       run tests and benchmarks n times (default 10)
   -d  --benchtime <d>       run each benchmark for duration d (default 1s)
@@ -70,6 +75,7 @@ Options:
 Example invocations:
   $ benchdiff --sheets ./pkg/...
   $ benchdiff --old=master~ --new=master --threshold=0.2 ./pkg/kv ./pkg/storage/...
+  $ benchdiff --old-env=FEATURE=false --new-env=FEATURE=true ./pkg/kv/...
   $ benchdiff --new=d1fbdb2 --run=Datum --count=2 --csv ./pkg/sql/...
   $ benchdiff --new=6299bd4 --sheets --post-checkout='dev generate go' ./pkg/workload/...`
 
@@ -135,6 +141,7 @@ func main() {
 func run(ctx context.Context) error {
 	var help, outCSV, outHTML, outSheets bool
 	var oldRef, newRef, order, postChck, runPattern, benchTime, previousRun string
+	var oldEnvValues, newEnvValues []string
 	var itersPerTest int
 	var cpuProfile, memProfile, mutexProfile bool
 	var threshold float64
@@ -149,6 +156,8 @@ func run(ctx context.Context) error {
 	pflag.BoolVarP(&useBazel, "bazel", "b", false, "")
 	pflag.StringVarP(&oldRef, "old", "o", "", "")
 	pflag.StringVarP(&newRef, "new", "n", "", "")
+	pflag.StringArrayVar(&oldEnvValues, "old-env", nil, "")
+	pflag.StringArrayVar(&newEnvValues, "new-env", nil, "")
 	pflag.StringVarP(&order, "sort", "s", "delta", "")
 	pflag.StringVarP(&postChck, "post-checkout", "", "", "")
 	pflag.StringVarP(&runPattern, "run", "r", ".", "")
@@ -172,10 +181,18 @@ func run(ctx context.Context) error {
 	pkgFilter := prArgs
 	sort.Strings(pkgFilter)
 
+	oldEnv, err := parseEnvOverrides(oldEnvValues)
+	if err != nil {
+		return errors.Wrap(err, "parsing --old-env")
+	}
+	newEnv, err := parseEnvOverrides(newEnvValues)
+	if err != nil {
+		return errors.Wrap(err, "parsing --new-env")
+	}
+
 	// Parse the output format.
 	var out outputFmt
 	var srv *google.Service
-	var err error
 	switch {
 	case outCSV:
 		if outHTML {
@@ -199,6 +216,15 @@ func run(ctx context.Context) error {
 		out = text
 	}
 
+	// Environment-only comparisons run the current binary under two runtime
+	// configurations. Explicit commit flags retain the existing ref defaults.
+	envComparison := len(oldEnv) > 0 || len(newEnv) > 0
+	oldRefSpecified := pflag.Lookup("old").Changed
+	newRefSpecified := pflag.Lookup("new").Changed
+	if envComparison && !oldRefSpecified && !newRefSpecified {
+		oldRef, newRef = "HEAD", "HEAD"
+	}
+
 	// Parse the specified git refs.
 	oldRef, newRef, err = parseGitRefs(oldRef, newRef)
 	if err != nil {
@@ -214,8 +240,9 @@ func run(ctx context.Context) error {
 	}
 
 	// Build the benchmark suites.
-	oldSuite := makeBenchSuite(oldRef, oldSubject, useBazel)
-	newSuite := makeBenchSuite(newRef, newSubject, useBazel)
+	isolateArtifacts := envComparison || oldRef == newRef
+	oldSuite := makeBenchSuite("old", oldRef, oldSubject, oldEnv, useBazel, isolateArtifacts)
+	newSuite := makeBenchSuite("new", newRef, newSubject, newEnv, useBazel, isolateArtifacts)
 	defer oldSuite.close()
 	defer newSuite.close()
 
@@ -243,12 +270,10 @@ func run(ctx context.Context) error {
 		}
 
 		// Install existing artifacts into benchSuites.
-		oldSuite.artDir = testArtifactsDir(oldSuite.ref)
 		oldSuite.outFile, err = os.Open(oldSuite.getOutputFile(t))
 		if err != nil {
 			return err
 		}
-		newSuite.artDir = testArtifactsDir(newSuite.ref)
 		newSuite.outFile, err = os.Open(newSuite.getOutputFile(t))
 		if err != nil {
 			return err
@@ -352,7 +377,7 @@ func runCmpBenches(
 		// Log the command invocation once per test for each suite.
 		for _, b := range []*benchSuite{bs1, bs2} {
 			args := b.buildBenchArgs(t, runPattern, benchTime, cpuProfile, memProfile, mutexProfile)
-			if err := logRunCommand(b.getRunFile(b.timestamp), args); err != nil {
+			if err := logRunCommand(b.getRunFile(b.timestamp), b.env, args); err != nil {
 				return errors.Wrap(err, "logging run command")
 			}
 		}
@@ -487,6 +512,7 @@ func (bs *benchSuite) buildBenchArgs(
 	// and ignore the error because --help creates a failed error status. If there
 	// is a real error we'll hit it below.
 	cmd := exec.Command(bin, "--help")
+	cmd.Env = commandEnv(os.Environ(), bs.env)
 	out, _ := cmd.CombinedOutput()
 	hasLogToStderr := bytes.Contains(out, []byte("logtostderr"))
 
@@ -514,7 +540,7 @@ func (bs *benchSuite) runSingleBench(
 	test, runPattern, benchTime string, cpuProfile, memProfile, mutexProfile bool,
 ) error {
 	args := bs.buildBenchArgs(test, runPattern, benchTime, cpuProfile, memProfile, mutexProfile)
-	if err := spawnWith(os.Stdin, bs.outFile, bs.outFile, args...); err != nil {
+	if err := spawnWithEnv(os.Stdin, bs.outFile, bs.outFile, bs.env, args...); err != nil {
 		if exitErr, ok := err.(*exec.ExitError); ok {
 			if exitErr.ExitCode() == 1 {
 				// Assume exit code 1 corresponds to a benchmark failure.
@@ -529,11 +555,17 @@ func (bs *benchSuite) runSingleBench(
 	return nil
 }
 
-// logRunCommand appends the command invocation to the run file.
-func logRunCommand(path string, args []string) error {
+// logRunCommand writes the benchmark invocation to the run file.
+func logRunCommand(path string, env, args []string) error {
 	// Build the command as a single line with quoted arguments.
-	quoted := make([]string, len(args))
-	for i, arg := range args {
+	command := make([]string, 0, len(env)+len(args)+1)
+	if len(env) > 0 {
+		command = append(command, "env")
+		command = append(command, env...)
+	}
+	command = append(command, args...)
+	quoted := make([]string, len(command))
+	for i, arg := range command {
 		quoted[i] = strconv.Quote(arg)
 	}
 	return os.WriteFile(path, []byte(strings.Join(quoted, " ")+"\n"), 0644)
@@ -650,6 +682,7 @@ func checkPassing(thresh float64, tables []*benchstat.Table) error {
 type benchSuite struct {
 	ref       string
 	subject   string // commit subject
+	env       []string
 	artDir    string
 	timestamp time.Time
 	outFile   *os.File
@@ -665,13 +698,21 @@ const (
 	mutexProfileName = "mutex.prof"
 )
 
-func makeBenchSuite(ref string, subject string, useBazel bool) benchSuite {
-	return benchSuite{
+func makeBenchSuite(
+	side, ref, subject string, env []string, useBazel, isolateArtifacts bool,
+) benchSuite {
+	bs := benchSuite{
 		ref:       ref,
 		subject:   subject,
+		env:       env,
 		testFiles: make(fileSet),
 		useBazel:  useBazel,
 	}
+	bs.artDir = testArtifactsDir(ref)
+	if isolateArtifacts {
+		bs.artDir = filepath.Join(bs.artDir, artifactNamespace(side, env))
+	}
+	return bs
 }
 
 func (bs *benchSuite) build(pkgFilter []string, postChck string, t time.Time) (err error) {
@@ -679,8 +720,9 @@ func (bs *benchSuite) build(pkgFilter []string, postChck string, t time.Time) (e
 		panic("benchSuite already built")
 	}
 
-	// Create the artifacts directory: ./benchdiff/<ref>/artifacts
-	bs.artDir = testArtifactsDir(bs.ref)
+	// Create the artifacts directory. Environment comparisons and same-ref
+	// comparisons use a side-specific namespace to prevent output and profile
+	// collisions while continuing to share the compiled binary cache.
 	if err = os.MkdirAll(bs.artDir, 0744); err != nil {
 		return err
 	}
@@ -766,7 +808,9 @@ func (bs *benchSuite) build(pkgFilter []string, postChck string, t time.Time) (e
 }
 
 func (bs *benchSuite) close() {
-	_ = bs.outFile.Close()
+	if bs.outFile != nil {
+		_ = bs.outFile.Close()
+	}
 }
 
 func (bs *benchSuite) getOutputFile(t time.Time) string {
@@ -829,7 +873,13 @@ func (fs fileSet) sorted() []string {
 
 func printHeader(w io.Writer, oldSuite, newSuite benchSuite) {
 	fmt.Fprintf(w, "old:  %s %.50s\n", oldSuite.ref, oldSuite.subject)
+	if len(oldSuite.env) > 0 {
+		fmt.Fprintf(w, "      env: %s\n", strings.Join(oldSuite.env, " "))
+	}
 	fmt.Fprintf(w, "new:  %s %.50s\n", newSuite.ref, newSuite.subject)
+	if len(newSuite.env) > 0 {
+		fmt.Fprintf(w, "      env: %s\n", strings.Join(newSuite.env, " "))
+	}
 	fmt.Fprintf(w, "args: %s\n\n", strings.Join(func() []string {
 		quoted := make([]string, 1+len(os.Args[1:]))
 		quoted[0] = "benchdiff"

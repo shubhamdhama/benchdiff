@@ -5,6 +5,8 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"sort"
+	"strings"
 
 	"github.com/pkg/errors"
 )
@@ -46,6 +48,12 @@ func spawn(args ...string) error {
 // code, run returns a generic "process exited with status..." error, as the
 // process has likely written an error message to stderr.
 func spawnWith(in io.Reader, out, err io.Writer, args ...string) error {
+	return spawnWithEnv(in, out, err, nil, args...)
+}
+
+// spawnWithEnv executes the command with the supplied environment overrides.
+// The command continues to inherit all other variables from benchdiff.
+func spawnWithEnv(in io.Reader, out, err io.Writer, env []string, args ...string) error {
 	var cmd *exec.Cmd
 	if len(args) == 0 {
 		panic("spawn called with no arguments")
@@ -55,18 +63,44 @@ func spawnWith(in io.Reader, out, err io.Writer, args ...string) error {
 		cmd = exec.Command(args[0], args[1:]...)
 	}
 
-	// Ensure that GODEBUG=[...,]runtimecontentionstacks=1 is set to improve
-	// mutex profiles.
-	env := os.Environ()
-	envGodebug := os.Getenv("GODEBUG")
-	if envGodebug != "" {
-		envGodebug += ","
-	}
-	envGodebug += "runtimecontentionstacks=1"
-	cmd.Env = append(env, "GODEBUG="+envGodebug)
+	cmd.Env = commandEnv(os.Environ(), env)
 
 	cmd.Stdin = in
 	cmd.Stdout = out
 	cmd.Stderr = err
 	return cmd.Run()
+}
+
+// commandEnv overlays overrides onto base and ensures that
+// runtimecontentionstacks remains enabled for mutex profiles.
+func commandEnv(base, overrides []string) []string {
+	merged := make(map[string]string, len(base)+len(overrides))
+	for _, entry := range append(append([]string(nil), base...), overrides...) {
+		name, _, ok := strings.Cut(entry, "=")
+		if ok {
+			merged[name] = entry
+		}
+	}
+
+	envGodebug := ""
+	if entry, ok := merged["GODEBUG"]; ok {
+		_, envGodebug, _ = strings.Cut(entry, "=")
+	}
+	if envGodebug != "" {
+		envGodebug += ","
+	}
+	envGodebug += "runtimecontentionstacks=1"
+	merged["GODEBUG"] = "GODEBUG=" + envGodebug
+
+	names := make([]string, 0, len(merged))
+	for name := range merged {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+
+	env := make([]string, 0, len(names))
+	for _, name := range names {
+		env = append(env, merged[name])
+	}
+	return env
 }
