@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/pkg/errors"
 )
@@ -30,16 +31,30 @@ func expandPackages(pkgFilter []string) ([]string, error) {
 	return strings.Split(pkgs, "\n"), nil
 }
 
-// testDir returns the directory to store benchdiff artifacts and binaries for
-// specified git ref.
+// testDir returns the legacy directory to store benchdiff artifacts and
+// binaries for a specified git ref. New runs use testDirAt to keep each
+// invocation isolated from other benchdiff processes.
 func testDir(ref string) string {
 	return filepath.Join("benchdiff", ref)
 }
 
-// testArtifactsDir returns the directory to store benchdiff artifacts for
-// specified git ref.
+// testDirAt returns the directory to store benchdiff artifacts and binaries
+// for a specified git ref and benchmark run.
+func testDirAt(t time.Time, ref string) string {
+	if t.IsZero() {
+		return testDir(ref)
+	}
+	return filepath.Join("benchdiff", t.UTC().Format(workspaceTimeFormat)+"-"+ref)
+}
+
+// testArtifactsDir returns the legacy directory to store benchdiff artifacts
+// for a specified git ref.
 func testArtifactsDir(ref string) string {
 	return filepath.Join(testDir(ref), "artifacts")
+}
+
+func testArtifactsDirAt(t time.Time, ref string) string {
+	return filepath.Join(testDirAt(t, ref), "artifacts")
 }
 
 func hash(s []string) string {
@@ -51,10 +66,14 @@ func hash(s []string) string {
 	return strconv.Itoa(int(u))
 }
 
-// testArtifactsDir returns the directory to store benchdiff binaries for
+// testBinDir returns the legacy directory to store benchdiff binaries for a
 // specified git ref.
 func testBinDir(ref string, pkgFilter []string) string {
 	return filepath.Join(testDir(ref), "bin", hash(pkgFilter))
+}
+
+func testBinDirAt(t time.Time, ref string, pkgFilter []string) string {
+	return filepath.Join(testDirAt(t, ref), "bin", hash(pkgFilter))
 }
 
 // pkgToTestBin translates a Go package name into a test binary name.

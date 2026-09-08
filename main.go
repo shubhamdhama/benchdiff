@@ -131,7 +131,10 @@ const (
 	sheets
 )
 
-const timeFormat = "2006-01-02T15_04_05Z07:00"
+const (
+	timeFormat          = "2006-01-02T15_04_05Z07:00"
+	workspaceTimeFormat = "060102150405"
+)
 
 func main() {
 	if err := run(context.Background()); err != nil {
@@ -242,10 +245,22 @@ func run(ctx context.Context) error {
 		return err
 	}
 
+	// Pick one timestamp for the entire comparison. Besides identifying the
+	// output files, it gives this invocation an isolated local workspace.
+	runTime := time.Now().UTC()
+	if previousRun != "" {
+		runTime, err = time.Parse(timeFormat, previousRun)
+		if err != nil {
+			return err
+		}
+	}
+
 	// Build the benchmark suites.
 	isolateArtifacts := envComparison || oldRef == newRef
 	oldSuite := makeBenchSuite("old", oldRef, oldSubject, oldEnv, useBazel, isolateArtifacts)
 	newSuite := makeBenchSuite("new", newRef, newSubject, newEnv, useBazel, isolateArtifacts)
+	oldSuite.setWorkspace(runTime)
+	newSuite.setWorkspace(runTime)
 	defer oldSuite.close()
 	defer newSuite.close()
 
@@ -260,7 +275,7 @@ func run(ctx context.Context) error {
 			}
 		}
 
-		if err := buildBenches(ctx, pkgFilter, postChck, &oldSuite, &newSuite); err != nil {
+		if err := buildBenches(ctx, pkgFilter, postChck, runTime, &oldSuite, &newSuite); err != nil {
 			return err
 		}
 		if err := runner.Prepare(ctx, &oldSuite, &newSuite); err != nil {
@@ -278,17 +293,18 @@ func run(ctx context.Context) error {
 		}
 	} else {
 		// Find output files for the given run.
-		t, err := time.Parse(timeFormat, previousRun)
-		if err != nil {
-			return err
-		}
-
 		// Install existing artifacts into benchSuites.
-		oldSuite.outFile, err = os.Open(oldSuite.getOutputFile(t))
+		oldSuite.outFile, err = os.Open(oldSuite.getOutputFile(runTime))
+		if os.IsNotExist(err) {
+			// Existing results predate per-invocation workspaces.
+			oldSuite.setWorkspace(time.Time{})
+			newSuite.setWorkspace(time.Time{})
+			oldSuite.outFile, err = os.Open(oldSuite.getOutputFile(runTime))
+		}
 		if err != nil {
 			return err
 		}
-		newSuite.outFile, err = os.Open(newSuite.getOutputFile(t))
+		newSuite.outFile, err = os.Open(newSuite.getOutputFile(runTime))
 		if err != nil {
 			return err
 		}
@@ -357,7 +373,7 @@ func parseGitRefs(oldRef, newRef string) (string, string, error) {
 }
 
 func buildBenches(
-	ctx context.Context, pkgFilter []string, postChck string, bss ...*benchSuite,
+	ctx context.Context, pkgFilter []string, postChck string, runTime time.Time, bss ...*benchSuite,
 ) error {
 	// Get the current branch so we can revert to it after, if possible.
 	if ref, ok, err := getCurSymbolicRef(); err != nil {
@@ -365,9 +381,8 @@ func buildBenches(
 	} else if ok {
 		defer checkoutRef(ref, "")
 	}
-	now := time.Now() // used to uniquely name artifact files
 	for _, bs := range bss {
-		if err := bs.build(pkgFilter, postChck, now); err != nil {
+		if err := bs.build(pkgFilter, postChck, runTime); err != nil {
 			return err
 		}
 	}
@@ -717,16 +732,18 @@ func checkPassing(thresh float64, tables []*benchstat.Table) error {
 }
 
 type benchSuite struct {
-	side      string
-	ref       string
-	subject   string // commit subject
-	env       []string
-	artDir    string
-	timestamp time.Time
-	outFile   *os.File
-	binDir    string
-	useBazel  bool
-	testFiles fileSet
+	side             string
+	ref              string
+	subject          string // commit subject
+	env              []string
+	artDir           string
+	timestamp        time.Time
+	workspaceTime    time.Time
+	isolateArtifacts bool
+	outFile          *os.File
+	binDir           string
+	useBazel         bool
+	testFiles        fileSet
 }
 type fileSet map[string]struct{}
 
@@ -747,11 +764,17 @@ func makeBenchSuite(
 		testFiles: make(fileSet),
 		useBazel:  useBazel,
 	}
-	bs.artDir = testArtifactsDir(ref)
-	if isolateArtifacts {
-		bs.artDir = filepath.Join(bs.artDir, artifactNamespace(side, env))
-	}
+	bs.isolateArtifacts = isolateArtifacts
+	bs.setWorkspace(time.Time{})
 	return bs
+}
+
+func (bs *benchSuite) setWorkspace(t time.Time) {
+	bs.workspaceTime = t
+	bs.artDir = testArtifactsDirAt(t, bs.ref)
+	if bs.isolateArtifacts {
+		bs.artDir = filepath.Join(bs.artDir, artifactNamespace(bs.side, bs.env))
+	}
 }
 
 func (bs *benchSuite) build(pkgFilter []string, postChck string, t time.Time) (err error) {
@@ -777,8 +800,8 @@ func (bs *benchSuite) build(pkgFilter []string, postChck string, t time.Time) (e
 		return err
 	}
 
-	// Create the binary directory: ./benchdiff/<ref>/bin/<hash(pkgFilter)>
-	bs.binDir = testBinDir(bs.ref, pkgFilter)
+	// Create the binary directory in this invocation's isolated workspace.
+	bs.binDir = testBinDirAt(bs.workspaceTime, bs.ref, pkgFilter)
 	if _, err = os.Stat(bs.binDir); err == nil {
 		files, err := ioutil.ReadDir(bs.binDir)
 		if err != nil {
