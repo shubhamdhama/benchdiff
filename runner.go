@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -193,10 +194,10 @@ func (r *roachprodBenchRunner) Run(ctx context.Context, bs *benchSuite, run benc
 		remoteSuiteDir, "profiles", fmt.Sprintf("run-%d", r.runCount[bs]),
 	)
 	if run.profilesEnabled() {
-		if err := r.roachprod(
-			ctx, os.Stdout, os.Stderr, "run", r.target, "--", "mkdir", "-p", remoteProfileDir,
+		if err := r.roachprodQuiet(
+			ctx, "creating remote profile directory", "run", r.target, "--", "mkdir", "-p", remoteProfileDir,
 		); err != nil {
-			return errors.Wrap(err, "creating remote profile directory")
+			return err
 		}
 	}
 
@@ -208,14 +209,13 @@ func (r *roachprodBenchRunner) Run(ctx context.Context, bs *benchSuite, run benc
 		return err
 	}
 	remoteProfiles := path.Join(remoteProfileDir, "*")
-	r.logf("retrieving %s profiles from %s", bs.side, remoteProfileDir)
-	if err := r.roachprod(
-		ctx, os.Stdout, os.Stderr, "get", r.target, remoteProfiles, bs.profileRunDir(),
+	if err := r.roachprodQuiet(
+		ctx, "retrieving remote profiles", "get", r.target, remoteProfiles, bs.profileRunDir(),
 	); err != nil {
 		if runErr != nil {
 			return errors.Wrapf(err, "benchmark command also failed: %v", runErr)
 		}
-		return errors.Wrap(err, "retrieving remote profiles")
+		return err
 	}
 	return runErr
 }
@@ -230,6 +230,23 @@ func (r *roachprodBenchRunner) roachprod(
 	return spawnWithEnvContext(
 		ctx, os.Stdin, stdout, stderr, nil, append([]string{"roachprod"}, args...)...,
 	)
+}
+
+// roachprodQuiet keeps roachprod's transfer progress from corrupting the
+// benchmark spinner. Its command output is included if the operation fails.
+func (r *roachprodBenchRunner) roachprodQuiet(
+	ctx context.Context, operation string, args ...string,
+) error {
+	var stdout, stderr bytes.Buffer
+	err := r.roachprod(ctx, &stdout, &stderr, args...)
+	if err == nil {
+		return nil
+	}
+	output := strings.TrimSpace(stdout.String() + "\n" + stderr.String())
+	if output == "" {
+		return errors.Wrap(err, operation)
+	}
+	return errors.Wrapf(err, "%s: %s", operation, output)
 }
 
 var _ benchRunner = localBenchRunner{}
